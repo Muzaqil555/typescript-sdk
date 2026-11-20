@@ -188,7 +188,7 @@ export function isOAuthClientProvider(provider: AuthProvider | OAuthClientProvid
 export async function handleOAuthUnauthorized(
     provider: OAuthClientProvider,
     ctx: UnauthorizedContext,
-    extraAuthOptions?: Pick<AuthOptions, 'skipIssuerMetadataValidation'>
+    extraAuthOptions?: Pick<AuthOptions, 'skipIssuerMetadataValidation' | 'issuerValidator'>
 ): Promise<void> {
     const { resourceMetadataUrl, scope } = extractWWWAuthenticateParams(ctx.response);
     const result = await auth(provider, {
@@ -226,7 +226,7 @@ export async function handleOAuthUnauthorized(
  */
 export function adaptOAuthProvider(
     provider: OAuthClientProvider,
-    extraAuthOptions?: Pick<AuthOptions, 'skipIssuerMetadataValidation'>
+    extraAuthOptions?: Pick<AuthOptions, 'skipIssuerMetadataValidation' | 'issuerValidator'>
 ): AuthProvider {
     return {
         token: async () => {
@@ -1046,10 +1046,24 @@ export interface AuthOptions {
      * server discovery. Disabling it is **security-weakening** and intended only
      * for authorization servers known to publish a mismatched `issuer`. The unchecked
      * `issuer` is also what `expectedIssuer` and stored `issuer` stamps are compared with.
+     * Prefer {@linkcode AuthOptions.issuerValidator | issuerValidator} (e.g.
+     * {@linkcode createEntraIssuerValidator}) when only a known issuer pattern
+     * such as Microsoft Entra ID's `{tenantid}` template needs to be accepted.
      *
      * @default false
      */
     skipIssuerMetadataValidation?: boolean;
+    /**
+     * Custom validator for the authorization server's metadata `issuer` during
+     * discovery, forwarded to {@linkcode discoverAuthorizationServerMetadata}.
+     *
+     * Called only when the default RFC 8414 §3.3 exact-match check fails (for
+     * example, multi-tenant Microsoft Entra ID endpoints such as
+     * `/organizations/v2.0` or `/common/v2.0` that publish a templated
+     * `https://login.microsoftonline.com/{tenantid}/v2.0` issuer — see
+     * {@linkcode createEntraIssuerValidator}).
+     */
+    issuerValidator?: IssuerValidator;
     /**
      * When `true`, {@linkcode auth} skips the refresh-token branch even when a
      * `refresh_token` is available, and proceeds directly to a fresh
@@ -1174,6 +1188,7 @@ async function authInternal(
         resourceMetadataUrl,
         fetchFn,
         skipIssuerMetadataValidation,
+        issuerValidator,
         forceReauthorization
     }: AuthOptions
 ): Promise<AuthResult> {
@@ -1205,7 +1220,8 @@ async function authInternal(
             cachedState.authorizationServerMetadata ??
             (await discoverAuthorizationServerMetadata(authorizationServerUrl, {
                 fetchFn,
-                skipIssuerValidation: skipIssuerMetadataValidation
+                skipIssuerValidation: skipIssuerMetadataValidation,
+                issuerValidator
             }));
 
         // If resource metadata wasn't cached, try to fetch it for selectResourceURL
@@ -1240,7 +1256,8 @@ async function authInternal(
         const serverInfo = await discoverOAuthServerInfo(serverUrl, {
             resourceMetadataUrl: effectiveResourceMetadataUrl,
             fetchFn,
-            skipIssuerMetadataValidation
+            skipIssuerMetadataValidation,
+            issuerValidator
         });
         authorizationServerUrl = serverInfo.authorizationServerUrl;
         metadata = serverInfo.authorizationServerMetadata;
@@ -1921,6 +1938,71 @@ export function buildDiscoveryUrls(authorizationServerUrl: string | URL): { url:
 }
 
 /**
+ * Custom predicate for validating the `issuer` in fetched authorization server
+ * metadata (`received`) against the discovery URL (`expected`).
+ *
+ * Called by {@linkcode discoverAuthorizationServerMetadata} only when the default
+ * RFC 8414 §3.3 exact match fails. Return `true` to accept `received` as a valid
+ * issuer for `expected`, or `false` to reject with {@linkcode IssuerMismatchError}.
+ */
+export type IssuerValidator = (expected: URL, received: URL) => boolean;
+
+/**
+ * Returns an {@linkcode IssuerValidator} that accepts Microsoft Entra ID's
+ * multi-tenant `{tenantid}` issuer template (e.g.,
+ * `https://login.microsoftonline.com/{tenantid}/v2.0`) when discovering against
+ * `/organizations/v2.0`, `/common/v2.0`, `/consumers/v2.0`, or a tenant path on
+ * an allowed Entra host.
+ *
+ * @param allowedHosts - Hostnames permitted to return the `{tenantid}` template.
+ *   Defaults to `['login.microsoftonline.com']`.
+ */
+export function createEntraIssuerValidator(allowedHosts: string[] = ['login.microsoftonline.com']): IssuerValidator {
+    const normalizedAllowedHosts = new Set(allowedHosts.map(h => h.toLowerCase()));
+    return (expected: URL, received: URL): boolean => {
+        if (
+            expected.protocol !== received.protocol ||
+            expected.host.toLowerCase() !== received.host.toLowerCase() ||
+            expected.port !== received.port
+        ) {
+            return false;
+        }
+        if (expected.href === received.href) {
+            return true;
+        }
+        if (!normalizedAllowedHosts.has(received.hostname.toLowerCase())) {
+            return false;
+        }
+        if (expected.search !== received.search || expected.hash !== received.hash) {
+            return false;
+        }
+        const expSegments = expected.pathname.split('/').filter(Boolean);
+        const recSegments = received.pathname.split('/').filter(Boolean);
+        if (expSegments.length === 0 || expSegments.length !== recSegments.length) {
+            return false;
+        }
+        for (const [i, expSegment] of expSegments.entries()) {
+            let decodedExp: string;
+            let decodedRec: string;
+            try {
+                decodedExp = decodeURIComponent(expSegment);
+                decodedRec = decodeURIComponent(recSegments[i]!);
+            } catch {
+                return false;
+            }
+            if (decodedExp === decodedRec) {
+                continue;
+            }
+            if (decodedRec.toLowerCase() === '{tenantid}' && decodedExp.length > 0) {
+                continue;
+            }
+            return false;
+        }
+        return true;
+    };
+}
+
+/**
  * Discovers authorization server metadata with support for
  * {@link https://datatracker.ietf.org/doc/html/rfc8414 | RFC 8414} OAuth 2.0
  * Authorization Server Metadata and
@@ -1936,14 +2018,18 @@ export function buildDiscoveryUrls(authorizationServerUrl: string | URL): { url:
  *                                 metadata was not found.
  * The returned metadata's `issuer` is validated against `authorizationServerUrl`
  * per RFC 8414 §3.3 (and OIDC Discovery §4.3): if they differ the metadata is
- * **rejected** with {@linkcode IssuerMismatchError} and not returned. Set
- * `skipIssuerValidation: true` to suppress this check — **security-weakening**,
+ * **rejected** with {@linkcode IssuerMismatchError} and not returned. Pass
+ * `issuerValidator` (for example {@linkcode createEntraIssuerValidator} for
+ * multi-tenant Microsoft Entra ID endpoints whose metadata publishes a literal
+ * `{tenantid}` template) to accept a specific mismatch pattern, or set
+ * `skipIssuerValidation: true` to suppress this check entirely — **security-weakening**,
  * intended only for known-misconfigured authorization servers.
  *
  * @param options - Configuration options
  * @param options.fetchFn - Optional fetch function for making HTTP requests, defaults to global fetch
  * @param options.protocolVersion - MCP protocol version to use, defaults to {@linkcode LATEST_PROTOCOL_VERSION}
  * @param options.skipIssuerValidation - Skip the RFC 8414 §3.3 `issuer` echo check. **Security-weakening.**
+ * @param options.issuerValidator - Custom predicate consulted when the exact RFC 8414 §3.3 `issuer` match fails
  * @returns Promise resolving to authorization server metadata, or undefined if discovery fails
  * @throws {IssuerMismatchError} when the metadata's `issuer` does not match `authorizationServerUrl`
  */
@@ -1952,11 +2038,13 @@ export async function discoverAuthorizationServerMetadata(
     {
         fetchFn = fetch,
         protocolVersion = LATEST_PROTOCOL_VERSION,
-        skipIssuerValidation = false
+        skipIssuerValidation = false,
+        issuerValidator
     }: {
         fetchFn?: FetchLike;
         protocolVersion?: string;
         skipIssuerValidation?: boolean;
+        issuerValidator?: IssuerValidator;
     } = {}
 ): Promise<AuthorizationServerMetadata | undefined> {
     const headers = {
@@ -2005,8 +2093,15 @@ export async function discoverAuthorizationServerMetadata(
             // SDK-generated (not attacker-controlled), so accept the slash-only difference here.
             // The tolerance is one-directional and end-anchored — a different host or path is still
             // a mismatch.
-            const matches =
+            let matches =
                 parsed.issuer === expectedIssuer || (expectedIssuer.endsWith('/') && parsed.issuer === expectedIssuer.slice(0, -1));
+            if (!matches && issuerValidator) {
+                try {
+                    matches = issuerValidator(new URL(expectedIssuer), new URL(parsed.issuer)) === true;
+                } catch {
+                    matches = false;
+                }
+            }
             if (!matches) {
                 throw new IssuerMismatchError('metadata', expectedIssuer, parsed.issuer);
             }
@@ -2071,6 +2166,11 @@ export async function discoverOAuthServerInfo(
          * `skipIssuerValidation`. **Security-weakening** — see {@linkcode AuthOptions.skipIssuerMetadataValidation}.
          */
         skipIssuerMetadataValidation?: boolean;
+        /**
+         * Forwarded to {@linkcode discoverAuthorizationServerMetadata}.
+         * See {@linkcode AuthOptions.issuerValidator}.
+         */
+        issuerValidator?: IssuerValidator;
     }
 ): Promise<OAuthServerInfo> {
     let resourceMetadata: OAuthProtectedResourceMetadata | undefined;
@@ -2103,7 +2203,8 @@ export async function discoverOAuthServerInfo(
 
     const authorizationServerMetadata = await discoverAuthorizationServerMetadata(authorizationServerUrl, {
         fetchFn: opts?.fetchFn,
-        skipIssuerValidation: opts?.skipIssuerMetadataValidation
+        skipIssuerValidation: opts?.skipIssuerMetadataValidation,
+        issuerValidator: opts?.issuerValidator
     });
 
     return {

@@ -16,13 +16,14 @@ import {
 import type { Mock } from 'vitest';
 import { expect, vi } from 'vitest';
 
-import type { OAuthClientProvider } from '../../src/client/auth';
+import type { IssuerValidator, OAuthClientProvider } from '../../src/client/auth';
 import {
     assertSecureTokenEndpoint,
     auth,
     AuthorizationServerMismatchError,
     buildDiscoveryUrls,
     computeScopeUnion,
+    createEntraIssuerValidator,
     determineScope,
     discardIfIssuerMismatch,
     discoverAuthorizationServerMetadata,
@@ -1236,6 +1237,186 @@ describe('OAuth Authorization', () => {
                     discoverAuthorizationServerMetadata('https://attacker.example.com', { skipIssuerValidation: true })
                 ).resolves.toMatchObject({ issuer: 'https://honest.example.com' });
             });
+
+            it('rejects multi-tenant Entra ID {tenantid} template issuer by default', async () => {
+                mockFetch.mockResolvedValueOnce({
+                    ok: true,
+                    status: 200,
+                    json: async () => ({
+                        ...validOAuthMetadata,
+                        issuer: 'https://login.microsoftonline.com/{tenantid}/v2.0'
+                    })
+                });
+
+                const err = await discoverAuthorizationServerMetadata('https://login.microsoftonline.com/organizations/v2.0').catch(
+                    error => error
+                );
+                expect(err).toBeInstanceOf(IssuerMismatchError);
+                expect(err.kind).toBe('metadata');
+                expect(err.expected).toBe('https://login.microsoftonline.com/organizations/v2.0');
+                expect(err.received).toBe('https://login.microsoftonline.com/{tenantid}/v2.0');
+            });
+
+            it('consults custom issuerValidator when exact match fails', async () => {
+                const validator = vi.fn<IssuerValidator>((expected, received) => {
+                    return expected.origin === received.origin && received.pathname === '/custom-issuer';
+                });
+
+                mockFetch.mockResolvedValueOnce({
+                    ok: true,
+                    status: 200,
+                    json: async () => ({ ...validOAuthMetadata, issuer: 'https://auth.example.com/custom-issuer' })
+                });
+
+                await expect(
+                    discoverAuthorizationServerMetadata('https://auth.example.com/tenant1', {
+                        issuerValidator: validator
+                    })
+                ).resolves.toMatchObject({ issuer: 'https://auth.example.com/custom-issuer' });
+
+                expect(validator).toHaveBeenCalledTimes(1);
+                expect(validator.mock.calls[0]![0].href).toBe('https://auth.example.com/tenant1');
+                expect(validator.mock.calls[0]![1].href).toBe('https://auth.example.com/custom-issuer');
+
+                // Rejects with IssuerMismatchError when issuerValidator returns false
+                mockFetch.mockResolvedValueOnce({
+                    ok: true,
+                    status: 200,
+                    json: async () => ({ ...validOAuthMetadata, issuer: 'https://auth.example.com/other' })
+                });
+
+                await expect(
+                    discoverAuthorizationServerMetadata('https://auth.example.com/tenant1', {
+                        issuerValidator: validator
+                    })
+                ).rejects.toThrow(IssuerMismatchError);
+            });
+
+            it('rejects with IssuerMismatchError when received issuer is not a valid URL even if issuerValidator is provided', async () => {
+                const validator = vi.fn<IssuerValidator>(() => true);
+
+                mockFetch.mockResolvedValueOnce({
+                    ok: true,
+                    status: 200,
+                    json: async () => ({ ...validOAuthMetadata, issuer: 'not a valid url' })
+                });
+
+                await expect(
+                    discoverAuthorizationServerMetadata('https://auth.example.com/tenant1', {
+                        issuerValidator: validator
+                    })
+                ).rejects.toThrow(IssuerMismatchError);
+                expect(validator).not.toHaveBeenCalled();
+            });
+
+            describe('createEntraIssuerValidator', () => {
+                const entraIssuer = 'https://login.microsoftonline.com/{tenantid}/v2.0';
+
+                it.each([
+                    'https://login.microsoftonline.com/organizations/v2.0',
+                    'https://login.microsoftonline.com/common/v2.0',
+                    'https://login.microsoftonline.com/consumers/v2.0',
+                    'https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0'
+                ])('accepts %s returning {tenantid} template in discoverAuthorizationServerMetadata', async discoveryUrl => {
+                    mockFetch.mockResolvedValueOnce({
+                        ok: true,
+                        status: 200,
+                        json: async () => ({ ...validOAuthMetadata, issuer: entraIssuer })
+                    });
+
+                    await expect(
+                        discoverAuthorizationServerMetadata(discoveryUrl, {
+                            issuerValidator: createEntraIssuerValidator()
+                        })
+                    ).resolves.toMatchObject({ issuer: entraIssuer });
+                });
+
+                it('handles WHATWG URL percent-encoding of {tenantid} (%7Btenantid%7D) and exact href matches', () => {
+                    const validator = createEntraIssuerValidator();
+                    const expected = new URL('https://login.microsoftonline.com/organizations/v2.0');
+                    const received = new URL('https://login.microsoftonline.com/{tenantid}/v2.0');
+                    expect(received.pathname).toBe('/%7Btenantid%7D/v2.0');
+                    expect(validator(expected, received)).toBe(true);
+                    expect(validator(expected, new URL('https://login.microsoftonline.com/organizations/v2.0'))).toBe(true);
+                });
+
+                it('supports custom allowedHosts (e.g. sovereign clouds)', () => {
+                    const validator = createEntraIssuerValidator(['login.microsoftonline.us']);
+                    expect(
+                        validator(
+                            new URL('https://login.microsoftonline.us/organizations/v2.0'),
+                            new URL('https://login.microsoftonline.us/{tenantid}/v2.0')
+                        )
+                    ).toBe(true);
+                    expect(
+                        validator(
+                            new URL('https://login.microsoftonline.com/organizations/v2.0'),
+                            new URL('https://login.microsoftonline.com/{tenantid}/v2.0')
+                        )
+                    ).toBe(false);
+                });
+
+                it.each([
+                    {
+                        label: 'mismatched host/origin',
+                        expected: 'https://login.microsoftonline.com/organizations/v2.0',
+                        received: 'https://attacker.example.com/{tenantid}/v2.0'
+                    },
+                    {
+                        label: 'mismatched protocol',
+                        expected: 'https://login.microsoftonline.com/organizations/v2.0',
+                        received: 'http://login.microsoftonline.com/{tenantid}/v2.0'
+                    },
+                    {
+                        label: 'mismatched port',
+                        expected: 'https://login.microsoftonline.com/organizations/v2.0',
+                        received: 'https://login.microsoftonline.com:8443/{tenantid}/v2.0'
+                    },
+                    {
+                        label: 'unapproved host not in allowedHosts',
+                        expected: 'https://auth.example.com/organizations/v2.0',
+                        received: 'https://auth.example.com/{tenantid}/v2.0'
+                    },
+                    {
+                        label: 'mismatched path suffix (/v1.0 vs /v2.0)',
+                        expected: 'https://login.microsoftonline.com/organizations/v2.0',
+                        received: 'https://login.microsoftonline.com/{tenantid}/v1.0'
+                    },
+                    {
+                        label: 'different non-template tenant segment',
+                        expected: 'https://login.microsoftonline.com/tenant-a/v2.0',
+                        received: 'https://login.microsoftonline.com/tenant-b/v2.0'
+                    },
+                    {
+                        label: 'fewer segments in received path',
+                        expected: 'https://login.microsoftonline.com/organizations/v2.0',
+                        received: 'https://login.microsoftonline.com/{tenantid}'
+                    },
+                    {
+                        label: 'more segments in received path',
+                        expected: 'https://login.microsoftonline.com/organizations/v2.0',
+                        received: 'https://login.microsoftonline.com/{tenantid}/v2.0/extra'
+                    },
+                    {
+                        label: 'empty root pathname',
+                        expected: 'https://login.microsoftonline.com/',
+                        received: 'https://login.microsoftonline.com/{tenantid}'
+                    },
+                    {
+                        label: 'mismatched query string',
+                        expected: 'https://login.microsoftonline.com/organizations/v2.0',
+                        received: 'https://login.microsoftonline.com/{tenantid}/v2.0?p=1'
+                    },
+                    {
+                        label: 'malformed percent-encoding in segment',
+                        expected: 'https://login.microsoftonline.com/organizations/v2.0',
+                        received: 'https://login.microsoftonline.com/%E0%A4%A/v2.0'
+                    }
+                ])('rejects $label', ({ expected, received }) => {
+                    const validator = createEntraIssuerValidator();
+                    expect(validator(new URL(expected), new URL(received))).toBe(false);
+                });
+            });
         });
     });
 
@@ -1457,6 +1638,47 @@ describe('OAuth Authorization', () => {
 
             await expect(discoverOAuthServerInfo('https://resource.example.com')).rejects.toThrow(TypeError);
         });
+
+        it('forwards issuerValidator to discoverAuthorizationServerMetadata', async () => {
+            const entraDiscoveryUrl = 'https://login.microsoftonline.com/organizations/v2.0';
+            const entraMetadata = {
+                ...validAuthMetadata,
+                issuer: 'https://login.microsoftonline.com/{tenantid}/v2.0'
+            };
+
+            mockFetch.mockImplementation(url => {
+                const urlString = url.toString();
+
+                if (urlString.includes('/.well-known/oauth-protected-resource')) {
+                    return Promise.resolve({
+                        ok: true,
+                        status: 200,
+                        json: async () => ({
+                            resource: 'https://resource.example.com',
+                            authorization_servers: [entraDiscoveryUrl]
+                        })
+                    });
+                }
+
+                if (urlString.includes('login.microsoftonline.com')) {
+                    return Promise.resolve({
+                        ok: true,
+                        status: 200,
+                        json: async () => entraMetadata
+                    });
+                }
+
+                return Promise.reject(new Error(`Unexpected fetch: ${urlString}`));
+            });
+
+            await expect(discoverOAuthServerInfo('https://resource.example.com')).rejects.toThrow(IssuerMismatchError);
+
+            const result = await discoverOAuthServerInfo('https://resource.example.com', {
+                issuerValidator: createEntraIssuerValidator()
+            });
+            expect(result.authorizationServerUrl).toBe(entraDiscoveryUrl);
+            expect(result.authorizationServerMetadata).toEqual(entraMetadata);
+        });
     });
 
     describe('auth with provider authorization server URL caching', () => {
@@ -1540,6 +1762,57 @@ describe('OAuth Authorization', () => {
             expect(saveResourceUrl).toHaveBeenCalledWith('https://resource.example.com');
             const authorizationUrl = vi.mocked(provider.redirectToAuthorization).mock.calls[0]![0];
             expect(authorizationUrl.searchParams.get('resource')).toBe('https://resource.example.com');
+        });
+
+        it('forwards issuerValidator through auth() for multi-tenant Entra ID discovery', async () => {
+            const entraDiscoveryUrl = 'https://login.microsoftonline.com/organizations/v2.0';
+            const entraMetadata = {
+                ...validAuthMetadata,
+                issuer: 'https://login.microsoftonline.com/{tenantid}/v2.0',
+                authorization_endpoint: 'https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize',
+                token_endpoint: 'https://login.microsoftonline.com/organizations/oauth2/v2.0/token'
+            };
+            const saveDiscoveryState = vi.fn();
+            const provider = createMockProvider({ saveDiscoveryState });
+
+            mockFetch.mockImplementation(url => {
+                const urlString = url.toString();
+
+                if (urlString.includes('/.well-known/oauth-protected-resource')) {
+                    return Promise.resolve({
+                        ok: true,
+                        status: 200,
+                        json: async () => ({
+                            resource: 'https://resource.example.com',
+                            authorization_servers: [entraDiscoveryUrl]
+                        })
+                    });
+                }
+
+                if (urlString.includes('login.microsoftonline.com')) {
+                    return Promise.resolve({
+                        ok: true,
+                        status: 200,
+                        json: async () => entraMetadata
+                    });
+                }
+
+                return Promise.reject(new Error(`Unexpected fetch: ${urlString}`));
+            });
+
+            await expect(auth(provider, { serverUrl: 'https://resource.example.com' })).rejects.toThrow(IssuerMismatchError);
+
+            const result = await auth(provider, {
+                serverUrl: 'https://resource.example.com',
+                issuerValidator: createEntraIssuerValidator()
+            });
+            expect(result).toBe('REDIRECT');
+            expect(saveDiscoveryState).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    authorizationServerUrl: entraDiscoveryUrl,
+                    authorizationServerMetadata: entraMetadata
+                })
+            );
         });
 
         it('restores full discovery state from cache including resource metadata', async () => {
